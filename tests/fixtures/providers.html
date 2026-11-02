@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><style>button,[role=button]{min-width:40px;min-height:30px;display:inline-block}textarea,[contenteditable=true]{width:400px;min-height:40px}uploader-file-preview,gem-attachment{display:block}</style><main></main><input-area-v2><form onsubmit="return false"><input type="file" multiple><div id="input" contenteditable="true" role="textbox"></div><button type="button" aria-label="Send message">发送</button></form></input-area-v2><script>
+window.sent=[];window.filesSeen=[];window.holdAnswers=false;window.interrupt=false;
+const gem=location.hostname==='gemini.google.com',form=document.querySelector('form');
+if(!gem){const old=document.querySelector('#input'),input=document.createElement('textarea');input.id='input';input.placeholder='Message DeepSeek';old.replaceWith(input)}
+const input=document.querySelector('#input'),text=()=>gem?input.innerText:input.value;
+document.querySelector('input[type=file]').onchange=event=>{for(const file of event.target.files){
+ filesSeen.push({name:file.name,size:file.size,type:file.type});const node=document.createElement(gem?'uploader-file-preview':'div');node.className='attachment';
+ const label='file-'+filesSeen.length;node.innerHTML='<div class="file-preview-container" aria-describedby="'+label+'"></div><span id="'+label+'">'+file.name+'</span><gem-attachment><span class="gem-attachment-text">'+file.name+'</span><span class="gem-attachment-extension-label">md</span></gem-attachment><button aria-label="Remove file '+file.name+'">移除</button>';form.append(node);
+}};
+document.querySelector('[aria-label="Send message"]').onclick=()=>{
+ const raw=text();sent.push(raw);if(gem)input.textContent='';else input.value='';
+ const node=document.createElement(gem?'user-query':'div');if(!gem){node.className='ds-message';node.setAttribute('data-virtual-list-item-key','q'+sent.length)}else node.dataset.messageId='q'+sent.length;
+ const body=document.createElement('div');body.className=gem?'query-text':'ds-collapsible-text';body.textContent=raw;node.append(body);for(const file of form.querySelectorAll('.attachment'))node.append(file);document.querySelector('main').append(node);
+ if(!/\/(?:app|chat\/s)\/[^/]+/.test(location.pathname))history.pushState({},'',gem?'/app/created-by-first-message':'/a/chat/s/created-by-first-message');
+ const stop=document.createElement('button');stop.setAttribute('aria-label','Stop response');form.append(stop);
+ window.completeAnswer=()=>{stop.remove();const answer=document.createElement(gem?'model-response':'div');if(!gem){answer.className='ds-message';answer.setAttribute('data-virtual-list-item-key','a'+sent.length)}else answer.dataset.messageId='a'+sent.length;
+ answer.innerHTML=gem?'<div class="thoughts-container">尚未完成的思考，不是回答</div><message-content><div class="markdown">本轮回答完成 '+sent.length+'</div></message-content>':'<div class="ds-think-content">尚未完成的思考，不是回答</div><div class="ds-assistant-message-main-content"><div class="ds-markdown">本轮回答完成 '+sent.length+'</div></div>';document.querySelector('main').append(answer)};
+ if(interrupt)setTimeout(()=>{history.pushState({},'',gem?'/app/unrelated':'/a/chat/s/unrelated');document.querySelector('main').append(document.createElement('hr'))},250);
+ if(!holdAnswers)setTimeout(completeAnswer,1000);
+};</script>

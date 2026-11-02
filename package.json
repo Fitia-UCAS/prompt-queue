@@ -1,0 +1,14 @@
+{
+  "name": "prompt-queue",
+  "version": "0.6.34",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/unit/*.test.cjs",
+    "check": "node scripts/verify.mjs",
+    "check:browser": "node scripts/verify.mjs --browser",
+    "audit": "node scripts/audit.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

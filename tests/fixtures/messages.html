@@ -1,0 +1,22 @@
+<!doctype html><meta charset="utf-8"><style>button{min-width:30px;min-height:25px}#prompt-textarea{min-height:60px;border:1px solid}section{padding:8px}</style>
+<main><section><header><h5 class="sr-only">你说：</h5></header><div data-user-message-bubble>历史问题</div></section><section><header><h4>ChatGPT 说：</h4></header><div data-markdown-copy-text="true"><p>历史回答</p></div></section></main>
+<form data-chatgpt-composer onsubmit="return false"><input type="file" aria-label="Attach files"><div id="prompt-textarea" contenteditable="true" role="textbox"></div><button type="button" data-testid="fruitjuice-send-button">发送</button></form>
+<script>
+window.clicks=0;window.__listeners=[];window.chrome={runtime:{onMessage:{addListener(fn){__listeners.push(fn)}},async sendMessage(m){return m.type==='PF_FILE_CHUNK'?{ok:true,chunk:btoa('abc')}:{ok:true}}}};
+window.bridgeMessage=m=>new Promise(resolve=>{for(const fn of __listeners)fn(m,{},resolve)});
+const editor=document.querySelector('#prompt-textarea'),form=document.querySelector('form');
+document.querySelector('input[type=file]').onchange=event=>{for(const file of event.target.files){const chip=document.createElement('div');chip.className='attachment';chip.setAttribute('aria-label',file.name);chip.textContent=file.name;form.append(chip);}};
+document.querySelector('[data-testid="fruitjuice-send-button"]').onclick=()=>{
+ clicks++;const raw=editor.innerText;window.rawSent=raw;editor.textContent='';
+ const user=document.createElement(window.mode==='attribute'?'article':'section');
+ user.innerHTML=mode==='attribute'?'<div data-message-role="user" data-message-id="new-user"><div data-user-message-bubble></div></div>':'<header><h4>You said:</h4></header><div data-user-message-bubble></div>';
+ const bubble=user.querySelector('[data-user-message-bubble]');
+ if(mode==='rich')bubble.innerHTML=marked.parse(raw);else bubble.textContent=mode==='folded'?raw.slice(0,140)+'…':raw;
+ if(mode==='folded'){const expand=document.createElement('button');expand.textContent='展开';expand.onclick=()=>{bubble.textContent=raw;expand.remove()};user.append(expand);}
+ for(const file of form.querySelectorAll('.attachment')){user.append(file);}
+ if(mode==='image'){user.querySelectorAll('.attachment').forEach(node=>node.remove());user.insertAdjacentHTML('afterbegin','<img alt="上传的图片" width="140" height="100" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=">');}
+ if(mode.startsWith('bare'))user.querySelector('header')?.remove();
+ document.querySelector('main').append(user);
+ const answer=document.createElement('section');answer.innerHTML=mode.startsWith('bare')?'<div class="markdown prose"><p>本轮文件已收到。</p><p>这是新的回答。</p></div><button>复制</button>':'<header><h5>ChatGPT said:</h5></header><div data-markdown-copy-text="true"><p>本轮文件已收到。</p><p>这是新的回答。</p></div><button>复制</button>';document.querySelector('main').append(answer);
+};
+</script>
