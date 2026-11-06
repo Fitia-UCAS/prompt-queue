@@ -66,6 +66,20 @@ class ChatGPTAdapter extends Adapter {
       any('[role="status"][aria-busy="true"], [data-talvt-turn-state="in_progress"]')
     );
   }
+  canSendWhileGenerating(input) {
+    // The composer submit ID can also belong to the stop button.
+    const button = findSendButton(input, [
+      'button[data-testid="send-button"]',
+      'button[data-testid="fruitjuice-send-button"]',
+      'button[aria-label="Send prompt" i]',
+      'button[aria-label="Send message" i]',
+      'button[aria-label="Send" i]',
+      'button[aria-label="发送提示"]',
+      'button[aria-label="发送消息"]',
+      'button[aria-label="发送"]'
+    ]);
+    return !!button?.checkVisibility({ visibilityProperty: true });
+  }
   getSendButton(input) {
     if (globalThis.PromptFlowSupervisor)
       return PromptFlowSupervisor.sendBtn(input || this.getInputElement());

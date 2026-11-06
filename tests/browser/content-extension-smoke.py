@@ -80,10 +80,36 @@ with TemporaryDirectory(prefix='extension-', dir=OUT) as profile:
             worker.evaluate('tab=>chrome.scripting.executeScript({target:{tabId:tab},files:["content/loader.js"]})', tab)
             target.wait_for_timeout(100)
             assert len(shadows()) == 3
+
+            target.evaluate('''() => {
+                const composer = document.querySelector('#prompt-textarea');
+                const send = document.querySelector('[aria-label="Send message"]');
+                send.dataset.testid = 'send-button';
+                send.insertAdjacentHTML('afterend',
+                    '<button type="button" id="composer-submit-button" data-testid="stop-button" aria-label="停止">停止</button>');
+                window.nativeSubmissions = [];
+                composer.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter' || event.defaultPrevented || send.disabled) return;
+                    event.preventDefault();
+                    window.nativeSubmissions.push(composer.value);
+                    composer.value = '';
+                });
+            }''')
+            composer = target.locator('#prompt-textarea')
+            composer.fill('Adjust the current answer')
+            composer.press('Enter')
+            assert target.evaluate('window.nativeSubmissions') == ['Adjust the current answer']
+            assert composer.input_value() == ''
+            target.locator('[data-testid="send-button"]').evaluate('button => button.disabled = true')
+            composer.fill('Send after the current answer')
+            composer.press('Enter')
+            target.wait_for_function("document.querySelector('#prompt-textarea').value === ''")
+            assert target.evaluate('window.nativeSubmissions') == ['Adjust the current answer']
             assert not errors, errors
             report = {'result': 'PASS', 'root': str(ROOT), 'checks': ['real content loader and declared module resources',
                 'three original closed Shadow DOM hosts', 'actual keyboard palette search through background RPC and insertion',
-                'repeatable supervisor lock blocks manual insertion', 'release restores insertion', 'reinjecting loader does not duplicate hosts']}
+                'repeatable supervisor lock blocks manual insertion', 'release restores insertion', 'reinjecting loader does not duplicate hosts',
+                'ChatGPT Enter uses native send during generation when enabled and queues otherwise']}
             (OUT / 'extension-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
             print(json.dumps(report, ensure_ascii=False, indent=2))
         finally:

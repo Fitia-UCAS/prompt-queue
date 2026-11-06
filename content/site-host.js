@@ -251,7 +251,8 @@ export function createSiteHost(adapter) {
     }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       const composer = eventComposer(event);
-      if (!composer || !adapter.isGenerating()) return;
+      if (!composer || !adapter.isGenerating() || adapter.canSendWhileGenerating?.(composer))
+        return;
       const draft = readComposer(composer);
       if (!draft.trim()) return;
       event.preventDefault();
