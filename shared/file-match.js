@@ -17,36 +17,39 @@
   const attachmentsOf = (step) => step.attachments || (step.attachment ? [step.attachment] : []);
   const canMatch = (flow) =>
     flow.steps.some((s) => missingOf(s).length || (!attachmentsOf(s).length && sourceHint(s.text)));
+  async function directoryRead(action) {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(action),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('附件目录未响应，请重新选择附件目录')), 3000);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   async function granted(directory) {
     try {
-      return !!directory && (await directory.queryPermission({ mode: 'read' })) === 'granted';
+      return !!directory && (await directoryRead(() => directory.queryPermission({ mode: 'read' }))) === 'granted';
     } catch {
       return false;
     }
   }
   async function walk(handle, visit, path = '', depth = 0, state = { visited: 0 }) {
     if (depth > 20) throw new Error('目录层级过深');
-    for await (const [name, entry] of handle.entries()) {
+    const iterator = handle.entries()[Symbol.asyncIterator]();
+    for (;;) {
+      const next = await directoryRead(() => iterator.next());
+      if (next.done) break;
+      const [name, entry] = next.value;
       if (++state.visited > 50000) throw new Error('目录文件过多，请选择更小的目录');
       if (entry.kind === 'directory') {
         if (!name.startsWith('.') && name !== 'node_modules')
           await walk(entry, visit, path + name + '/', depth + 1, state);
-      } else await visit({ name, path: path + name, getFile: () => entry.getFile() });
+      } else await visit({ name, path: path + name, getFile: () => directoryRead(() => entry.getFile()) });
     }
-  }
-  async function cacheDirectory(directory, store) {
-    if (!(await granted(directory)) || !store.cacheSourceFile) return { cached: 0 };
-    let cached = 0;
-    await walk(directory, async (entry) => {
-      if (!/\.(?:md|markdown|txt|json|pdf|docx|csv|xlsx|png|jpe?g|webp|gif)$/i.test(entry.name))
-        return;
-      const file = await entry.getFile();
-      if (file.size > 0) {
-        await store.cacheSourceFile(entry.path, file);
-        cached++;
-      }
-    });
-    return { cached };
   }
   async function match(flow, directory, store) {
     const missing = flow.steps.filter((s) => missingOf(s).length),
@@ -138,8 +141,9 @@
       converted++;
       matched++;
     }
-    return { matched, remaining: missing.reduce((n, s) => n + missingOf(s).length, 0), ambiguous };
+    const remaining = missing.reduce((n, s) => n + missingOf(s).length, 0);
+    return { matched, remaining, ambiguous, permissionRequired: !live && remaining > 0 };
   }
-  root.PromptFlowFileMatch = { match, canMatch, sourceText, sourceHint, cacheDirectory };
+  root.PromptFlowFileMatch = { match, canMatch, sourceText, sourceHint };
   if (typeof module !== 'undefined') module.exports = root.PromptFlowFileMatch;
 })(globalThis);

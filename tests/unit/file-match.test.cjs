@@ -29,3 +29,16 @@ test('目录权限失效后复用原附件缓存，不弹出授权或再次保�
   const report=await Match.match(flow,root,{async sourceFiles(){return[{path:'a.md',name:'a.md',ref}];},async saveFile(){throw Error('应复用已有缓存');}});
   assert.equal(report.matched,1);assert.equal(report.remaining,0);assert.equal(flow.steps[0].attachment.id,'cached');assert.equal(flow.steps[0].missingAttachment,null);
 });
+test('旧目录权限查询永久挂起时仍可结束匹配，不阻止后续换目录',async()=>{
+  const flow={steps:[{missingAttachment:{name:'a.md'}}]};
+  const hung=dir('old',[]);hung.queryPermission=()=>new Promise(()=>{});
+  const report=await Match.match(flow,hung,store);
+  assert.equal(report.remaining,1);assert.equal(report.permissionRequired,true);
+  const next=await Match.match(flow,dir('new',[['a.md',file('a.md')]]),store);
+  assert.equal(next.matched,1);assert.equal(next.remaining,0);
+});
+test('目录枚举挂起时明确报错，不无限等待',async()=>{
+  const flow={steps:[{missingAttachment:{name:'a.md'}}]};
+  const hung=dir('old',[]);hung.entries=()=>({[Symbol.asyncIterator](){return this;},next:()=>new Promise(()=>{})});
+  await assert.rejects(Match.match(flow,hung,store),/目录未响应/);
+});

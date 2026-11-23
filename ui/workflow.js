@@ -75,10 +75,33 @@ const task = (action) => async (event) => {
   try {
     await action(event);
   } catch (error) {
+    console.error('[PromptQueue UI]', error);
     const known = UI_ERRORS.find(([pattern]) => pattern.test(error.message));
     notice(known ? known[1] : error.message);
   }
 };
+async function importStage(stage, action) {
+  const started = Date.now();
+  const report = (status, detail = '') => {
+    const value = { stage, status, at: Date.now(), elapsedMs: Date.now() - started, detail };
+    console[status === 'error' ? 'error' : 'info']('[PromptQueue import]', value);
+    chrome.storage.local.set({ pqImportDiagnostic: value }).catch(console.error);
+    notice(`${stage}${status === 'waiting' ? `（已等待 ${Math.floor(value.elapsedMs / 1000)} 秒）` : '…'}`, false);
+    clearTimeout(noticeTimer);
+  };
+  report('started');
+  const timer = setInterval(() => report('waiting'), 5000);
+  try {
+    const value = await action();
+    report('completed');
+    return value;
+  } catch (error) {
+    report('error', error.stack || error.message);
+    throw error;
+  } finally {
+    clearInterval(timer);
+  }
+}
 function switchView(next) {
   view = next;
   for (const name of ['library', 'editor', 'monitor', 'trash', 'settings']) {
@@ -289,7 +312,7 @@ async function openFlow(id, autoMatch = true) {
   editor = M.flow(library.flows.find((f) => f.id === id));
   switchView('editor');
   displayEditor(true);
-  if (autoMatch && sourceDirectory && PromptFlowFileMatch.canMatch(editor)) {
+  if (autoMatch && PromptFlowFileMatch.canMatch(editor)) {
     try {
       const report = await matchSource(editor);
       if (report.matched) {
@@ -423,15 +446,9 @@ async function updateConnection() {
   paintConnection(connected);
 }
 async function importChat(file) {
-  notice('正在解析聊天记录与附件…', true);
-  const parsed = C.parse(await file.text()),
-    value = await C.materialize(parsed, S);
-  let matchError = '';
-  try {
-    await matchSource(value);
-  } catch (error) {
-    matchError = error.message;
-  }
+  const text = await importStage('正在读取聊天记录', () => file.text());
+  const parsed = await importStage('正在解析聊天轮次', () => C.parse(text));
+  const value = await importStage('正在还原记录中的附件', () => C.materialize(parsed, S));
   if (creationMode && editor) {
     value.id = editor.id;
     if (hasContent(editor)) {
@@ -439,22 +456,41 @@ async function importChat(file) {
       if (editor.title !== '新流程') value.title = editor.title;
     }
     editor = M.flow(value);
-    await persist();
+    await importStage('正在保存导入流程', () => persist());
     displayEditor();
   } else {
-    await S.saveFlow(value);
+    await importStage('正在保存导入流程', () => S.saveFlow(value));
     library = await S.readLibrary();
     await openFlow(value.id, false);
   }
   displayLibrary();
   if ($('steps').firstElementChild) $('steps').firstElementChild.open = true;
-  const missing = value.steps.filter((s) => s.missingAttachment).length;
+  let matchError = '';
+  try {
+    if (PromptFlowFileMatch.canMatch(editor)) {
+      const report = await importStage(`已导入 ${parsed.steps.length} 步，正在匹配附件目录`, () => matchSource(editor));
+      if (report.permissionRequired) matchError = '原附件目录未响应或未获授权，请重新选择附件目录';
+      displaySteps();
+      await importStage('正在保存附件匹配结果', () => persist());
+    }
+  } catch (error) {
+    matchError = error.message;
+  }
+  const missing = editor.steps.reduce((n, s) => n + s.missingAttachments.length, 0);
+  await chrome.storage.local.set({ pqImportDiagnostic: {
+    stage: '聊天导入完成', status: missing ? 'needs-attachments' : (matchError ? 'error' : 'completed'),
+    at: Date.now(), steps: editor.steps.length,
+    missingFiles: editor.steps.flatMap(s => s.missingAttachments.map(a => a.name)),
+    detail: matchError
+  }});
   notice(
     `已导入 ${value.steps.length} 步${missing ? `，${missing} 个附件待匹配` : ''}${matchError ? `；${matchError}` : ''}`,
-    !missing
+    !missing && !matchError
   );
 }
 async function matchSource(flow) {
+  sourceDirectory = (await S.getDirectory()) || null;
+  $('directory-name').textContent = sourceDirectory ? sourceDirectory.name : '选择附件目录';
   if (!sourceDirectory)
     return { matched: 0, remaining: flow.steps.filter((s) => s.missingAttachment).length };
   return PromptFlowFileMatch.match(flow, sourceDirectory.handle, S);
@@ -467,7 +503,7 @@ async function matchFiles() {
   displaySteps();
   await persist();
   notice(
-    `已匹配 ${report.matched} 个附件${report.ambiguous?.length ? `，${report.ambiguous.length} 个文件同名` : ''}`,
+    `已匹配 ${report.matched} 个附件${report.ambiguous?.length ? `，${report.ambiguous.length} 个文件同名` : ''}${report.permissionRequired ? '；原目录未响应或未获授权，请重新选择附件目录' : ''}`,
     !report.remaining
   );
 }
@@ -484,8 +520,7 @@ async function bindFolder() {
     if (error.name === 'AbortError') return;
     throw error;
   }
-  sourceDirectory = await S.saveDirectory(handle);
-  await PromptFlowFileMatch.cacheDirectory(handle, S);
+  sourceDirectory = await importStage('正在切换附件目录', () => S.saveDirectory(handle));
   $('directory-name').textContent = handle.name;
   if (editor) await matchFiles();
   else notice(`已选择 ${handle.name}`, true);
@@ -520,6 +555,16 @@ async function downloadFlow(all = false) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 const actions = {
+  'export-import-diagnostic': async () => {
+    const diagnostic = (await chrome.storage.local.get('pqImportDiagnostic')).pqImportDiagnostic;
+    if (!diagnostic) throw new Error('尚无导入诊断，请先尝试导入聊天记录');
+    const url = URL.createObjectURL(new Blob([JSON.stringify(diagnostic, null, 2)], {type:'application/json'}));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'prompt-queue-import-diagnostic.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  },
   new: newFlow,
   back: async () => {
     await persist();
@@ -716,7 +761,7 @@ $('settings-view')
   .forEach(
     (button) =>
       (button.innerHTML = icon(
-        { 'export-all': 'export', monitor: 'logs', trash: 'trash', 'export-dom': 'dom' }[
+        { 'export-all': 'export', monitor: 'logs', trash: 'trash', 'export-dom': 'dom', 'export-import-diagnostic': 'logs' }[
           button.dataset.action
         ] || 'file'
       ))

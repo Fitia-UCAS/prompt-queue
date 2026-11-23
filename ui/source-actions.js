@@ -161,7 +161,6 @@ export function sourceActions({ attach, readDraft, apply, setBusy, valid }) {
         const directory = await showDirectoryPicker({ id: 'prompt-chain-source', mode: 'read' });
         if (!valid()) return;
         await S.saveDirectory(directory);
-        await PromptFlowFileMatch.cacheDirectory(directory, S);
       })
     )
   );

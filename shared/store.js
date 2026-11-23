@@ -74,9 +74,13 @@
     return queueSource(async () => {
       const previous = await getDirectory();
       let same = false;
+      let timer;
       try {
-        same = !!previous?.handle && (await previous.handle.isSameEntry(handle));
-      } catch {}
+        same = !!previous?.handle && (await Promise.race([
+          previous.handle.isSameEntry(handle),
+          new Promise(resolve => { timer = setTimeout(() => resolve(false), 3000); })
+        ]));
+      } catch {} finally { clearTimeout(timer); }
       const value = {
         id: 'source-directory',
         name: handle.name,
