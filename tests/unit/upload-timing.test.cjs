@@ -7,8 +7,8 @@ const vm = require('node:vm');
 const ROOT = path.join(__dirname, '../..');
 const BRIDGE = process.env.BRIDGE_FILE || path.join(ROOT, 'content/bridge.js');
 
-function harness() {
-  let now = 0, busy = true, present = false, clicks = 0;
+function harness({text = '', requiresText = false} = {}) {
+  let now = 0, busy = true, present = false, clicks = 0, draft = '', sendEnabled = true;
   const sleeps = [], messageListeners = new Set(), inputListeners = new Set();
   const card = {node: {}};
   const input = {accept: '', disabled: false, multiple: true, files: null, hasAttribute: () => false,
@@ -18,16 +18,18 @@ function harness() {
     querySelectorAll: selector => selector.includes('input[type="file"]') ? [input]
       : selector.includes('aria-busy') ? (busy ? [{isConnected: true}] : []) : []};
   const composer = {isConnected: true, contains: () => true};
-  const sendButton = {click() {clicks++;}, getAttribute: () => null};
+  const sendButton = {click() {clicks++; draft = '';}, getAttribute: () => null};
   const chrome = {runtime: {onMessage: {addListener: fn => messageListeners.add(fn), removeListener: fn => messageListeners.delete(fn)},
     sendMessage(message) {
       if (message.type === 'PF_FILE_CHUNK') return Promise.resolve({ok: true, chunk: Buffer.from('abc').toString('base64')});
       return Promise.resolve({ok: true});
     }}};
   const supervisor = {
-    snapshot: () => ({draft: '', generating: false, url: 'https://chatgpt.com/c/upload'}),
-    composer: () => composer, scope: () => form, ctext: () => '', rendered: () => true, generating: () => false,
-    sendBtn: () => sendButton, describe: () => '', sleep: ms => new Promise(resolve => sleeps.push({at: now + ms, resolve})),
+    snapshot: () => ({draft, generating: false, url: 'https://chatgpt.com/c/upload'}),
+    composer: () => composer, scope: () => form, ctext: () => draft, rendered: () => true, generating: () => false,
+    fill: (_composer, text) => { draft = text; },
+    sendBtn: () => sendEnabled && (!requiresText || draft) ? sendButton : null,
+    describe: () => '', sleep: ms => new Promise(resolve => sleeps.push({at: now + ms, resolve})),
     attachmentRoots: () => [{root: form, kind: 'form'}],
     scanAttachment: () => present
       ? {state: 'match', strength: 'weak', reason: 'truncated-prefix', root: form, kind: 'form', nodes: [card.node],
@@ -51,7 +53,7 @@ function harness() {
   vm.runInContext(fs.readFileSync(BRIDGE, 'utf8'), context);
   const result = new Promise(resolve => {
     const receive = [...messageListeners][0];
-    receive({type: 'PF_SEND', operation: {id: 'op', runId: 'run', url: 'https://chatgpt.com/c/upload', text: '',
+    receive({type: 'PF_SEND', operation: {id: 'op', runId: 'run', url: 'https://chatgpt.com/c/upload', text,
       attachment: {id: 'file', name: '02-anadiplosis-information-linkage.md', size: 3, mimeType: 'text/markdown'}}}, {}, resolve);
   });
   async function flush(){for(let i=0;i<6;i++)await new Promise(resolve=>setImmediate(resolve));}
@@ -68,6 +70,7 @@ function harness() {
     await flush();
   }
   return {advance, get clicks() {return clicks;}, setBusy(value) {busy = value;}, setPresent(value) {present = value;}, get now() {return now;},
+    get draft() {return draft;}, setSendEnabled(value) {sendEnabled = value;},
     result, diagnostic: () => context.PromptChainFileUI.uploadDiagnostic()};
 }
 
@@ -89,6 +92,43 @@ test('上传忙碌持续超过八秒后，卡片在忙碌结束之后才渲染�
   assert.equal(h.diagnostic().previewMatched, true);
   assert.equal(h.diagnostic().v, 3);
   assert.ok(h.diagnostic().busySamples >= 40, 'busy samples should be recorded');
+});
+
+test('ChatGPT 慢附件处理完成后先填提示词，再等待发送按钮并只发一次', async () => {
+  const text = '请阅读这个附件。';
+  const h = harness({text, requiresText: true});
+  h.setSendEnabled(false);
+  await h.advance(250);
+  h.setPresent(true);
+  await h.advance(15000);
+  assert.equal(h.draft, '', 'still processing');
+  assert.equal(h.clicks, 0);
+  h.setBusy(false);
+  await h.advance(12000);
+  assert.equal(h.draft, text, 'attachment verification must not require an enabled send button');
+  assert.equal(h.diagnostic().waitingFor, 'attachment ready; waiting for send button');
+  assert.equal(h.clicks, 0);
+  h.setSendEnabled(true);
+  await h.advance(1000);
+  const outcome = await h.result;
+  assert.equal(outcome.ok, true, outcome.error);
+  assert.equal(h.clicks, 1);
+});
+
+test('ChatGPT 纯附件已处理但按钮始终不可用时，明确报发送等待超时', async () => {
+  const h = harness();
+  h.setSendEnabled(false);
+  await h.advance(250);
+  h.setPresent(true);
+  await h.advance(15000);
+  h.setBusy(false);
+  await h.advance(62000);
+  const outcome = await h.result;
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.error, /^SEND_BUTTON_UNAVAILABLE:.*60s/);
+  assert.equal(outcome.upload.previewMatched, true);
+  assert.equal(outcome.upload.sendReady, false);
+  assert.equal(h.clicks, 0);
 });
 
 test('转圈持续超过停滞窗口仍按已接收处理，不误报缺失', async () => {

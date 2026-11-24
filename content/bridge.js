@@ -24,6 +24,7 @@
   // already accepted, so it never counts towards the stall window.
   const UPLOAD_STALL_MS = 60000;
   const UPLOAD_BUDGET_MS = 180000;
+  const CHATGPT_ATTACHMENT_SEND_WAIT_MS = 60000;
   const invalidated = (error) =>
     /extension context invalidated/i.test(error?.message || String(error));
   function dispose() {
@@ -468,9 +469,7 @@
       const waitingFor = busy
         ? 'attachment still processing'
         : matched
-          ? sendReady
-            ? 'upload stability check'
-            : 'send button not ready'
+          ? 'upload stability check'
           : evidence.identity === 'mismatch'
             ? 'attachment identity conflict'
             : evidence.identity === 'unknown'
@@ -493,7 +492,7 @@
             describeScan(scan) +
             ')'
         );
-      if (matched && !busy && sendReady) {
+      if (matched && !busy) {
         quiet ||= now;
         if (now - quiet >= 850) {
           lastUploadState.waitingFor = 'ready';
@@ -526,8 +525,6 @@
           );
         }
       }
-      if (matched && !busy && !sendReady && now - timeline.startedAt > 10000)
-        throw new Error('SEND_BUTTON_UNAVAILABLE: Attachment is present, but send is unavailable');
     }
     throw new Error('UPLOAD_TIMEOUT: Attachment upload could not be confirmed');
   }
@@ -747,16 +744,13 @@
         throw new Error('UPLOAD_COMPOSER_CHANGED: Draft or composer changed');
       const scan = E.scanAttachmentSet(c, refs),
         error = uploadError(form);
-      const busy = uploadBusy(form),
-        sendReady = !!E.sendBtn(c);
+      const busy = uploadBusy(form);
       const confirmed = scan.files.filter((item) => item.state === 'match').length;
       const waitingFor =
         scan.state === 'match'
           ? busy
             ? 'processing'
-            : sendReady
-              ? 'upload stability'
-              : 'send button'
+             : 'upload stability'
           : (busy ? 'attachment still processing ' : 'waiting for attachment cards ') +
             confirmed +
             '/' +
@@ -777,7 +771,6 @@
       if (
         scan.state === 'match' &&
         !busy &&
-        sendReady &&
         selection.every((value) => value === 'confirmed')
       ) {
         quiet ||= Date.now();
@@ -813,8 +806,22 @@
     }
     throw new Error('UPLOAD_TIMEOUT: The complete attachment set was not confirmed');
   }
+  function chatAttachmentsReady(c, refs, op) {
+    const form = E.scope(c);
+    const scan = refs.length === 1 ? E.scanAttachment(c, refs[0]) : E.scanAttachmentSet(c, refs);
+    const error = uploadError(scan.root || form);
+    if (error) throw new Error('UPLOAD_REJECTED: ' + error);
+    if (uploadBusy(form) || (scan.root && scan.root !== form && uploadBusy(scan.root))) return false;
+    const identity =
+      refs.length === 1
+        ? evidenceOf(scan, selectionOf(chatUploadAttempt), aliasList(op)).identity
+        : scan.state;
+    if (identity !== 'match')
+      throw new Error('UPLOAD_ATTACHMENT_MISMATCH: The attachment set changed before sending');
+    return true;
+  }
   async function execute(op) {
-    let initialComposer;
+    let initialComposer, preparedDraft;
     const onInput = (event) => {
       if (
         event.isTrusted &&
@@ -947,24 +954,65 @@
         op.writing = true;
         try {
           E.fill(c, op.text);
+          if (M.echoNorm(E.ctext(c)) === M.echoNorm(op.text))
+            preparedDraft = { composer: c, text: E.ctext(c) };
         } finally {
           op.writing = false;
         }
       }
+      const chatAttachments =
+        refs.length > 0 &&
+        (!globalThis.PromptChainSiteAdapter || globalThis.PromptChainSiteAdapter.id === 'chatgpt');
+      const sendTimeoutMs = chatAttachments ? CHATGPT_ATTACHMENT_SEND_WAIT_MS : 10000;
       const started = Date.now();
       let button;
-      while (Date.now() - started < 10000) {
+      while (Date.now() - started < sendTimeoutMs) {
         guard(op);
-        button = E.sendBtn(c);
-        if (button) break;
+        if (E.composer() !== c || M.echoNorm(E.ctext(c)) !== M.echoNorm(op.text))
+          throw new Error('PAGE_CHANGED: The draft changed while waiting to send');
+        const attachmentsReady = !chatAttachments || chatAttachmentsReady(c, refs, op);
+        button = E.generating() ? null : E.sendBtn(c);
+        if (chatAttachments) {
+          const now = Date.now();
+          const timeline = lastUploadState.timeline;
+          if (button && timeline && !timeline.sendReadyAt) timeline.sendReadyAt = now;
+          Object.assign(lastUploadState, {
+            sampledAt: now,
+            elapsedMs: lastUploadState.elapsedMs + now - lastUploadState.sampledAt,
+            busy: !attachmentsReady,
+            sendReady: !!button,
+            sendWaitMs: now - started,
+            sendWaitTimeoutMs: sendTimeoutMs,
+            waitingFor: attachmentsReady
+              ? button
+                ? 'ready'
+                : 'attachment ready; waiting for send button'
+              : 'attachment still processing'
+          });
+        }
+        if (button && attachmentsReady) break;
+        button = null;
         await E.sleep(200);
       }
-      if (!button) throw new Error('SEND_BUTTON_UNAVAILABLE: Content remains in the composer');
+      if (!button) {
+        const detail =
+          chatAttachments && lastUploadState.busy
+            ? 'UPLOAD_TIMEOUT: Attachment still processing after the send wait'
+            : `SEND_BUTTON_UNAVAILABLE: Send button still unavailable after ${sendTimeoutMs / 1000}s`;
+        throw new Error(detail);
+      }
       const auth = await rpc({ type: 'PF_AUTHORIZE_SEND', runId: op.runId, operationId: op.id });
-      if (!auth?.ok) throw new Error('OPERATION_CANCELLED: Content remains in the composer');
+      if (!auth?.ok) throw new Error('OPERATION_CANCELLED: Send authorization expired');
       guard(op);
-      if (E.composer() !== c || M.echoNorm(E.ctext(c)) !== M.echoNorm(op.text) || E.generating())
+      if (
+        E.composer() !== c ||
+        M.echoNorm(E.ctext(c)) !== M.echoNorm(op.text) ||
+        E.generating() ||
+        (chatAttachments && !chatAttachmentsReady(c, refs, op))
+      )
         throw new Error('PAGE_CHANGED: The page changed before sending');
+      button = E.sendBtn(c);
+      if (!button) throw new Error('PAGE_CHANGED: The send button changed before sending');
       op.attempted = true;
       button.click();
       const sentAt = Date.now();
@@ -987,6 +1035,22 @@
           '. No message was resent.'
       );
     } catch (error) {
+      // Roll back only the unsent text this operation inserted. Resume can reuse
+      // the verified attachment, and manual changes stay in the composer.
+      if (
+        preparedDraft && active === op && !op.attempted && !op.edited &&
+        M.sameChat(op.url, location.href) && E.composer() === preparedDraft.composer &&
+        E.ctext(preparedDraft.composer) === preparedDraft.text
+      ) {
+        op.writing = true;
+        try {
+          E.fill(preparedDraft.composer, '');
+        } catch {
+          // Keep the original failure; the remaining draft is shown on resume.
+        } finally {
+          op.writing = false;
+        }
+      }
       return {
         ok: false,
         attempted: op.attempted,

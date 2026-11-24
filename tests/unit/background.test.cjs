@@ -231,6 +231,16 @@ test('发送结果不确定时暂停；服务线程重启和恢复不会自动�
   const restarted=harness(h.shared);await restarted.drain();const result=await restarted.message('PF_RESUME');
   assert.equal(result.ok,false);assert.match(result.error,/SEND_RECEIPT_UNCONFIRMED/);assert.equal(restarted.sends.length,0);
 });
+test('已授权但页面明确未点击发送时，恢复同一步无需确认重发',async()=>{
+  const h=harness();await h.drain();await h.message('PF_START',{tabId:4,flow:{steps:[{text:'本步提示词'}]}});await h.drain();
+  const pending=h.shared.pfRun.pending;
+  const auth=await h.message('PF_AUTHORIZE_SEND',{runId:pending.runId,operationId:pending.id},true);
+  assert.equal(auth.ok,true);assert.ok(h.shared.pfRun.pending.attemptedAt);
+  h.deliveries[0]({ok:false,attempted:false,error:'PAGE_CHANGED: The send button changed before sending'});await h.drain();
+  assert.equal(h.shared.pfRun.status,'paused');assert.equal(h.shared.pfRun.pending.attemptedAt,0);
+  const result=await h.message('PF_RESUME');assert.equal(result.ok,true,result.error);await h.drain();
+  assert.equal(h.sends.length,2);assert.equal(h.sends[1].text,'本步提示词');
+});
 test('暂停后不授权点击，非目标标签页不能读取附件或授权发送',async()=>{
   const h=harness();await h.drain();await h.message('PF_START',{tabId:4,flow:{steps:[{text:'测试'}]}});await h.drain();
   const pending=h.shared.pfRun.pending;await h.message('PF_PAUSE');

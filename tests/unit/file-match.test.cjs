@@ -15,7 +15,7 @@ test('递归匹配目录，只读取需要的文件，重复步骤复用附件',
   const flow={steps:[{missingAttachment:{name:'a.md'}},{missingAttachment:{name:'a.md'}},{missingAttachment:{name:'b.txt'}}]};
   const root=dir('prompts',[['sub',dir('sub',[['a.md',file('a.md')]])],['b.txt',file('b.txt')],['unused.txt',{kind:'file',getFile(){throw Error('must not read');}}]]);
   const report=await Match.match(flow,root,store);
-  assert.equal(report.matched,3);assert.equal(report.remaining,0);assert.equal(flow.steps[0].attachment.id,flow.steps[1].attachment.id);
+  assert.equal(report.matched,3);assert.equal(report.remaining,0);assert.equal(report.cached,0);assert.equal(flow.steps[0].attachment.id,flow.steps[1].attachment.id);
 });
 test('同名文件不擅自选择，权限失效时不读取目录',async()=>{
   const flow={steps:[{missingAttachment:{name:'a.md'}}]},root=dir('root',[['one',dir('one',[['a.md',file('a.md')]])],['two',dir('two',[['a.md',file('a.md')]])]]);
@@ -27,7 +27,7 @@ test('目录权限失效后复用原附件缓存，不弹出授权或再次保�
   const flow={steps:[{missingAttachment:{name:'a.md'}}]},ref={id:'cached',name:'a.md',size:4,mimeType:'text/plain'};
   const root=dir('root',[],'prompt');root.entries=()=>{throw Error('不得读取失效目录');};root.requestPermission=()=>{throw Error('不得反复授权');};
   const report=await Match.match(flow,root,{async sourceFiles(){return[{path:'a.md',name:'a.md',ref}];},async saveFile(){throw Error('应复用已有缓存');}});
-  assert.equal(report.matched,1);assert.equal(report.remaining,0);assert.equal(flow.steps[0].attachment.id,'cached');assert.equal(flow.steps[0].missingAttachment,null);
+  assert.equal(report.matched,1);assert.equal(report.remaining,0);assert.equal(report.cached,1);assert.equal(flow.steps[0].attachment.id,'cached');assert.equal(flow.steps[0].missingAttachment,null);
 });
 test('旧目录权限查询永久挂起时仍可结束匹配，不阻止后续换目录',async()=>{
   const flow={steps:[{missingAttachment:{name:'a.md'}}]};

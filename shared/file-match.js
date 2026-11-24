@@ -142,7 +142,7 @@
       matched++;
     }
     const remaining = missing.reduce((n, s) => n + missingOf(s).length, 0);
-    return { matched, remaining, ambiguous, permissionRequired: !live && remaining > 0 };
+    return { matched, remaining, ambiguous, cached: live ? 0 : matched, permissionRequired: !live && remaining > 0 };
   }
   root.PromptFlowFileMatch = { match, canMatch, sourceText, sourceHint };
   if (typeof module !== 'undefined') module.exports = root.PromptFlowFileMatch;

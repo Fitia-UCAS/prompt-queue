@@ -30,8 +30,11 @@ let library = { flows: [] },
   sourceDirectory = null,
   trash = [];
 let runCommandPending = false;
+let chatImportPending = false;
+class WorkflowRequestError extends Error {}
 const rpc = async (type, payload = {}) => {
   const response = await chrome.runtime.sendMessage({ type, ...payload });
+  if (response?.ok === false) throw new WorkflowRequestError(response.error || '操作未完成');
   if (!response?.ok) throw new Error(response?.error || '操作未完成');
   return response;
 };
@@ -75,7 +78,7 @@ const task = (action) => async (event) => {
   try {
     await action(event);
   } catch (error) {
-    console.error('[PromptQueue UI]', error);
+    if (!(error instanceof WorkflowRequestError)) console.error('[PromptQueue UI]', error);
     const known = UI_ERRORS.find(([pattern]) => pattern.test(error.message));
     notice(known ? known[1] : error.message);
   }
@@ -280,7 +283,11 @@ async function moveStep(id, offset, action = 'expand') {
 }
 function displayEditor(openSingle = false) {
   if (!editor) return;
-  $('creation-sources').hidden = !creationMode;
+  $('flow-sources').hidden = false;
+  $('source-chat').disabled = chatImportPending || !!locked();
+  $('source-chat').title = '从聊天记录导入，替换当前流程的全部步骤';
+  for (const id of ['source-skill', 'source-prompts', 'source-markdown'])
+    $(id).hidden = !creationMode;
   $('flow-title').value = editor.title;
   $('flow-title').disabled = !!locked();
   $('run').disabled = !!(runState && M.ACTIVE.has(runState.status));
@@ -291,15 +298,19 @@ function displayEditor(openSingle = false) {
     updateStepExpansion($('steps').firstElementChild);
   }
 }
+async function saveFlowChange(change) {
+  const saving = saveSerial.then(change);
+  saveSerial = saving.catch(() => {});
+  const value = await saving;
+  library = await S.readLibrary();
+  displayLibrary();
+  return value;
+}
 async function persist(announce = false) {
   clearTimeout(saveTimer);
   if (!editor || (creationMode && !hasContent(editor))) return;
   const snapshot = M.flow(editor);
-  const saving = saveSerial.then(() => S.saveFlow(snapshot));
-  saveSerial = saving.catch(() => {});
-  await saving;
-  library = await S.readLibrary();
-  displayLibrary();
+  await saveFlowChange(() => S.saveFlow(snapshot));
   if (announce) notice('已保存', true);
 }
 const autosave = () => {
@@ -309,16 +320,15 @@ const autosave = () => {
 async function openFlow(id, autoMatch = true) {
   if (view === 'editor') await persist();
   creationMode = false;
-  editor = M.flow(library.flows.find((f) => f.id === id));
+  const flow = M.flow(library.flows.find((f) => f.id === id));
+  editor = flow;
   switchView('editor');
   displayEditor(true);
-  if (autoMatch && PromptFlowFileMatch.canMatch(editor)) {
+  if (autoMatch && PromptFlowFileMatch.canMatch(flow)) {
     try {
-      const report = await matchSource(editor);
-      if (report.matched) {
-        displaySteps();
-        await persist();
-      }
+      const { report } = await matchSavedFlow(flow);
+      if (editor === flow && view === 'editor' && report.cached)
+        notice(attachmentMatchNotice(report));
     } catch (error) {
       notice(error.message);
     }
@@ -446,16 +456,23 @@ async function updateConnection() {
   paintConnection(connected);
 }
 async function importChat(file) {
+  const current = view === 'editor' ? editor : null;
+  if (current && locked()) throw new Error('请先停止流程再导入聊天');
+  const updating = !!current && hasContent(current);
   const text = await importStage('正在读取聊天记录', () => file.text());
   const parsed = await importStage('正在解析聊天轮次', () => C.parse(text));
   const value = await importStage('正在还原记录中的附件', () => C.materialize(parsed, S));
-  if (creationMode && editor) {
-    value.id = editor.id;
-    if (hasContent(editor)) {
-      value.steps = [...editor.steps, ...value.steps];
-      if (editor.title !== '新流程') value.title = editor.title;
-    }
+  if (current) {
+    if (view !== 'editor' || editor?.id !== current.id)
+      throw new Error('流程已切换，请在要更新的流程中重新导入');
+    if (locked()) throw new Error('请先停止流程再导入聊天');
+    value.id = current.id;
+    value.createdAt = current.createdAt;
+    value.description = current.description;
+    if (current.title.trim() && (!creationMode || current.title !== '新流程'))
+      value.title = current.title;
     editor = M.flow(value);
+    creationMode = false;
     await importStage('正在保存导入流程', () => persist());
     displayEditor();
   } else {
@@ -465,28 +482,63 @@ async function importChat(file) {
   }
   displayLibrary();
   if ($('steps').firstElementChild) $('steps').firstElementChild.open = true;
-  let matchError = '';
+  let imported = value, matchIssue = '', cached = 0;
   try {
-    if (PromptFlowFileMatch.canMatch(editor)) {
-      const report = await importStage(`已导入 ${parsed.steps.length} 步，正在匹配附件目录`, () => matchSource(editor));
-      if (report.permissionRequired) matchError = '原附件目录未响应或未获授权，请重新选择附件目录';
-      displaySteps();
-      await importStage('正在保存附件匹配结果', () => persist());
+    if (PromptFlowFileMatch.canMatch(value)) {
+      const result = await importStage(`已导入 ${parsed.steps.length} 步，正在匹配附件目录`, () => matchSavedFlow(value));
+      imported = result.flow;
+      cached = result.report.cached || 0;
+      matchIssue = attachmentMatchNotice(result.report);
     }
   } catch (error) {
-    matchError = error.message;
+    matchIssue = error.message;
   }
-  const missing = editor.steps.reduce((n, s) => n + s.missingAttachments.length, 0);
+  const missingFiles = imported.steps.flatMap(s => s.missingAttachments.map(a => a.name));
   await chrome.storage.local.set({ pqImportDiagnostic: {
-    stage: '聊天导入完成', status: missing ? 'needs-attachments' : (matchError ? 'error' : 'completed'),
-    at: Date.now(), steps: editor.steps.length,
-    missingFiles: editor.steps.flatMap(s => s.missingAttachments.map(a => a.name)),
-    detail: matchError
+    stage: '聊天导入完成',
+    status: missingFiles.length ? 'needs-attachments' : cached ? 'used-cache' : matchIssue ? 'error' : 'completed',
+    at: Date.now(), flowId: imported.id, steps: imported.steps.length, missingFiles, cached,
+    detail: matchIssue
   }});
+  const label = updating ? '已更新当前流程，共 ' : '已导入 ';
+  const heading = view === 'editor' && editor?.id !== imported.id ? `「${imported.title}」已导入 ` : label;
   notice(
-    `已导入 ${value.steps.length} 步${missing ? `，${missing} 个附件待匹配` : ''}${matchError ? `；${matchError}` : ''}`,
-    !missing && !matchError
+    `${heading}${imported.steps.length} 步${missingFiles.length ? `，${missingFiles.length} 个附件待匹配` : ''}${matchIssue ? `。${matchIssue}` : ''}`,
+    !missingFiles.length && !matchIssue
   );
+}
+function attachmentMatchNotice(report) {
+  if (report.cached)
+    return `有 ${report.cached} 个附件来自缓存。重新选择附件目录后导入可读取原文件`;
+  if (report.permissionRequired) return '附件目录无法读取，请重新选择附件目录';
+  return '';
+}
+async function matchSavedFlow(flow) {
+  const candidate = M.flow(flow);
+  const before = new Map(candidate.steps.map(step => [step.id, JSON.stringify(step)]));
+  const report = await matchSource(candidate);
+  if (!report.matched) return { flow, report };
+  const resolved = new Map(candidate.steps.map(M.step)
+    .filter(step => before.get(step.id) !== JSON.stringify(step))
+    .map(step => [step.id, step]));
+  // Apply matches to the same steps that were scanned, leaving newer edits intact.
+  const merge = (target) => {
+    target.steps = target.steps.map(step =>
+      resolved.has(step.id) && before.get(step.id) === JSON.stringify(M.step(step))
+        ? resolved.get(step.id) : step
+    );
+  };
+  if (editor?.id === flow.id) {
+    merge(editor);
+    if (view === 'editor') displaySteps();
+  }
+  const saved = await saveFlowChange(() => S.updateLibrary(data => {
+    const target = data.flows.find(item => item.id === flow.id);
+    if (!target) throw new Error('找不到要保存附件的流程');
+    merge(target);
+    return target;
+  }));
+  return { flow: saved, report };
 }
 async function matchSource(flow) {
   sourceDirectory = (await S.getDirectory()) || null;
@@ -496,15 +548,16 @@ async function matchSource(flow) {
   return PromptFlowFileMatch.match(flow, sourceDirectory.handle, S);
 }
 async function matchFiles() {
-  if (!editor) return;
+  const flow = editor;
+  if (!flow) return;
   if (locked()) throw new Error('请先停止流程');
   if (!sourceDirectory) return bindFolder();
-  const report = await matchSource(editor);
-  displaySteps();
   await persist();
+  const { report } = await matchSavedFlow(flow);
+  const matchIssue = attachmentMatchNotice(report);
   notice(
-    `已匹配 ${report.matched} 个附件${report.ambiguous?.length ? `，${report.ambiguous.length} 个文件同名` : ''}${report.permissionRequired ? '；原目录未响应或未获授权，请重新选择附件目录' : ''}`,
-    !report.remaining
+    `已匹配 ${report.matched} 个附件${report.ambiguous?.length ? `，${report.ambiguous.length} 个文件同名` : ''}${matchIssue ? `。${matchIssue}` : ''}`,
+    !report.remaining && !matchIssue
   );
 }
 async function bindFolder() {
@@ -795,7 +848,15 @@ $('refresh-connection').onclick = task(async () => {
 $('chat-file').onchange = task(async (event) => {
   const file = event.target.files[0];
   event.target.value = '';
-  if (file) await importChat(file);
+  if (!file || chatImportPending) return;
+  chatImportPending = true;
+  $('source-chat').disabled = true;
+  try {
+    await importChat(file);
+  } finally {
+    chatImportPending = false;
+    $('source-chat').disabled = !!locked();
+  }
 });
 $('source-chat').onclick = () => $('chat-file').click();
 $('source-prompts').onclick = () => $('prompts-file').click();

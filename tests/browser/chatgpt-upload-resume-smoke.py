@@ -16,6 +16,7 @@ HTML=HTML.replace("setTimeout(()=>node.removeAttribute('aria-busy'),300)", "cons
 HTML=HTML.replace("form.append(node);set", "form.append(node);set")
 HTML=HTML.replace("const form=document.querySelector('form'),editor=", "const form=document.querySelector('form');let editor=")
 HTML=HTML.replace("form.append(node);const timer", "form.append(node);const replacement=editor.cloneNode(true);editor.replaceWith(replacement);editor=replacement;const timer")
+WAITING_TO_SEND = '--waiting-to-send' in sys.argv
 if '--truncated' in sys.argv:
  HTML=HTML.replace("node.querySelector('span').textContent=f.name;node.querySelector('span').setAttribute('aria-label',f.name);", "node.querySelector('span').textContent=f.name.slice(0,20)+'...';")
  HTML=HTML.replace("'Remove '+f.name", "'Remove file'")
@@ -29,7 +30,15 @@ with TemporaryDirectory(prefix='pc-chatgpt-upload-',dir=str(OUT)) as profile:
    worker=context.service_workers[0] if context.service_workers else context.wait_for_event('serviceworker')
    base='/'.join(worker.url.split('/')[:3])+'/'
    target=context.new_page();target.route('https://chatgpt.com/**',lambda route:route.fulfill(status=200,content_type='text/html',body=HTML));target.goto('https://chatgpt.com/c/upload-resume')
-   flow=worker.evaluate("""async()=>{const attachment=await PromptFlowStore.saveFile(new File(['abc'],'02-anadiplosis-information-linkage.md',{type:'text/markdown'}));const flow=PromptFlowModel.flow({title:'ChatGPT upload recovery',steps:[{text:'First'},{attachment},{text:'Last'}]});await PromptFlowStore.saveFlow(flow);return flow}""")
+   attachment_prompt = 'Read this file.' if WAITING_TO_SEND else ''
+   if WAITING_TO_SEND:
+    target.evaluate('''() => {
+     document.querySelector('input[type="file"]').addEventListener('change', () => {
+      document.querySelector('[data-testid="send-button"]').disabled = true;
+      window.uploadReady = true;
+     });
+    }''')
+   flow=worker.evaluate("""async text=>{const attachment=await PromptFlowStore.saveFile(new File(['abc'],'02-anadiplosis-information-linkage.md',{type:'text/markdown'}));const flow=PromptFlowModel.flow({title:'ChatGPT upload recovery',steps:[{text:'First'},{attachment,text},{text:'Last'}]});await PromptFlowStore.saveFlow(flow);return flow}""",attachment_prompt)
    panel=context.new_page();panel.goto(base+'workflow.html?flow='+flow['id']);panel.locator('#target option').nth(1).wait_for(state='attached');panel.locator('#target').select_option(index=1);panel.locator('#run').click()
    target.wait_for_function('filesSeen.length===1')
    if '--unrelated-preview' in sys.argv:
@@ -43,6 +52,8 @@ with TemporaryDirectory(prefix='pc-chatgpt-upload-',dir=str(OUT)) as profile:
     assert target.evaluate('sendCount')==1 and len(target.evaluate('filesSeen'))==1
     print('Unrelated truncated preview rejected; file selection alone does not authorize sending',flush=True)
     raise SystemExit(0)
+   if WAITING_TO_SEND:
+    target.wait_for_function('text => document.querySelector("#prompt-textarea").textContent === text', arg=attachment_prompt)
    panel.locator('#pause').click()
    deadline=time.monotonic()+8
    while time.monotonic()<deadline:
@@ -50,8 +61,23 @@ with TemporaryDirectory(prefix='pc-chatgpt-upload-',dir=str(OUT)) as profile:
     operation=worker.evaluate('async()=>{const run=(await chrome.storage.local.get("pfRun")).pfRun;return(await chrome.tabs.sendMessage(run.tabId,{type:"PF_STATUS"})).snapshot.operation}')
     if state['status']=='paused' and not operation:break
     panel.wait_for_timeout(100)
-   assert state['status']=='paused' and state['phase']=='uploading',state
+   assert state['status']=='paused' and not operation,state
+   if WAITING_TO_SEND:
+    draft = target.locator('#prompt-textarea').inner_text()
+    assert not draft.strip(), {'draft': draft, 'diagnostic': state}
+    target.locator('[data-testid="send-button"]').evaluate('button => { button.disabled = false; }')
+   else:
+    assert state['phase']=='uploading',state
    assert target.evaluate('sendCount')==1 and target.locator('.attached').count()==1
+   if WAITING_TO_SEND:
+    errors = []
+    panel.on('console', lambda message: errors.append(message.text) if message.type == 'error' else None)
+    target.locator('#prompt-textarea').fill('A user draft')
+    panel.locator('#resume').click()
+    panel.locator('#notice').get_by_text('请先核对并清空残留草稿和附件', exact=False).wait_for()
+    assert target.locator('#prompt-textarea').inner_text()=='A user draft'
+    assert not any('[PromptQueue UI]' in error for error in errors), errors
+    target.locator('#prompt-textarea').fill('')
    target.evaluate('uploadReady=true');panel.locator('#resume').click()
    deadline=time.monotonic()+25;left_pause=False
    while time.monotonic()<deadline:
@@ -62,10 +88,14 @@ with TemporaryDirectory(prefix='pc-chatgpt-upload-',dir=str(OUT)) as profile:
     panel.wait_for_timeout(100)
    assert run['status']=='completed',run
    assert target.evaluate('sendCount')==3 and target.evaluate('filesSeen')==[{'name':'02-anadiplosis-information-linkage.md','size':3}]
+   if WAITING_TO_SEND:
+    assert target.locator('[data-message-author-role="user"] .whitespace-pre-wrap').all_text_contents()==['First', attachment_prompt, 'Last']
    diagnostic=panel.evaluate('()=>chrome.runtime.sendMessage({type:"PF_DIAGNOSTIC"})')['diagnostic']
    assert diagnostic['upload']['v']==3 and diagnostic['upload']['operation']['step']==2 and diagnostic['upload']['stage']=='observing',diagnostic['upload']
    if '--truncated' in sys.argv:
     assert diagnostic['upload']['identity']['state']=='match' and diagnostic['upload']['matchMode']=='matched-prefix',diagnostic['upload']
    report={'version':diagnostic['version'],'environment':'loaded extension, isolated Edge with local ChatGPT DOM; not a live account','checks':['Text, Markdown-only, text complete','Pause during upload then Run reuses the existing attachment; one file selection, three sends','Composer node replacement within the same form is accepted when draft is unchanged','ChatGPT upload diagnostics expose preview, processing, send readiness and reuse']}
+   if WAITING_TO_SEND:
+    report['checks'][0:2] = ['Pause while waiting for Send clears only the extension draft', 'Resume preserves a manual draft and displays the rejection without an extension error', 'Resume reuses the attachment and sends the original text once']
    (OUT/('chatgpt-truncated-upload-report.json' if '--truncated' in sys.argv else 'chatgpt-upload-resume-report.json')).write_text(json.dumps(report,indent=2),encoding='utf-8');print(json.dumps(report,indent=2))
   finally:context.close()

@@ -215,6 +215,7 @@ export function createRunner({
         return;
       }
     }
+    if (result?.attempted === false) run.pending.attemptedAt = 0;
     if (run.status === 'paused') {
       if (!/^OPERATION_(?:CANCELLED|BUSY)/.test(result?.error || ''))
         run.reason = result?.error || run.reason;

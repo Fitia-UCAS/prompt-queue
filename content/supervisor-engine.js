@@ -106,7 +106,10 @@
     sel.removeAllRanges();
     sel.addRange(r);
     try {
-      document.execCommand('insertText', false, val);
+      const inserted = val
+        ? document.execCommand('insertText', false, val)
+        : document.execCommand('delete');
+      if (!inserted) c.textContent = val;
     } catch {
       c.textContent = val;
     }
